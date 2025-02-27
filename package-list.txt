@@ -1,0 +1,3 @@
+luci-app-lucky
+luci-app-adguardhome
+luci-app-nikki
