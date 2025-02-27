@@ -15,41 +15,36 @@ on:
 
 jobs:
   build-ipks:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04  # 使用 Ubuntu 22.04 以获得更好的兼容性
     steps:
       # 步骤 1: 检出当前仓库
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      # 步骤 2: 安装依赖项
+      # 步骤 2: 安装依赖项 (针对 OpenWrt 24.10 更新)
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext unzip zlib1g-dev file python3 python3-setuptools rsync curl wget ccache xsltproc libxml-parser-perl flex bison quilt
+          sudo apt-get install -y build-essential clang flex bison g++ gawk \
+            gcc-multilib g++-multilib gettext git libncurses-dev libssl-dev \
+            python3-distutils python3-setuptools python3-dev rsync unzip \
+            zlib1g-dev file wget ccache fastjar java-propose-classpath \
+            libelf-dev libfuse-dev libpopt-dev libudev-dev patch \
+            pkgconf python3 python3-pip python3-ply python3-docutils \
+            default-jre-headless uglifyjs zip
           
-          # 对于 Ubuntu 20.04 及更高版本，python3-distutils 已包含在 python3-stdlib 中
-          # 检查 Ubuntu 版本并安装适当的包
-          if [ -f /etc/os-release ]; then
-            . /etc/os-release
-            if [[ "$VERSION_ID" == "18.04" ]]; then
-              sudo apt-get install -y python3-distutils
-            else
-              # 对于 Ubuntu 20.04+，确保 python3-stdlib 已安装（通常默认安装）
-              sudo apt-get install -y python3-stdlib || true
-            fi
-          fi
-          
-          # 显示 Python 版本和路径
+          # 显示系统信息
+          uname -a
+          gcc --version
           python3 --version
-          which python3
 
-      # 步骤 3: 克隆 ImmortalWrt 源码
+      # 步骤 3: 克隆 ImmortalWrt 源码 (使用 OpenWrt 24.10 分支)
       - name: Clone ImmortalWrt source code
         run: |
           git clone https://github.com/immortalwrt/immortalwrt.git
           cd immortalwrt
           
-          # 可选：切换到特定分支或标签
+          # 切换到 OpenWrt 24.10 分支
           git checkout openwrt-24.10
 
       # 步骤 4: 添加 kenzok8 的 small-package 软件源
@@ -70,7 +65,7 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      # 步骤 6: 准备构建配置
+      # 步骤 6: 准备构建配置 (针对 OpenWrt 24.10 更新)
       - name: Prepare build configuration
         working-directory: ./immortalwrt
         run: |
@@ -81,14 +76,39 @@ jobs:
           CONFIG_TARGET_x86=y
           CONFIG_TARGET_x86_64=y
           CONFIG_TARGET_x86_64_DEVICE_generic=y
+          # 使用 glibc 代替 musl
+          CONFIG_LIBC_USE_GLIBC=y
+          # 基础包
           CONFIG_PACKAGE_luci=y
           # 添加其他必要的基础配置
+          CONFIG_DEVEL=y
+          CONFIG_CCACHE=y
+          CONFIG_TOOLCHAINOPTS=y
+          CONFIG_GCC_USE_VERSION_13=y
           EOF
           
           # 使用 defconfig 补全配置
           make defconfig
+          
+          # 显示配置信息
+          echo "==== 配置信息 ===="
+          grep -E "CONFIG_LIBC|CONFIG_TARGET|CONFIG_GCC" .config
 
-      # 步骤 7: 读取要构建的包列表
+      # 步骤 7: 预先构建工具链和基础包
+      - name: Build toolchain and base packages
+        working-directory: ./immortalwrt
+        run: |
+          # 首先构建工具链和基础包
+          make tools/install -j$(nproc) || make tools/install V=s
+          make toolchain/install -j$(nproc) || make toolchain/install V=s
+          make target/compile -j$(nproc) || make target/compile V=s
+          
+          # 检查工具链是否正确构建
+          echo "==== 工具链信息 ===="
+          ls -la staging_dir/
+          find staging_dir -name "ld-*.so*" || echo "No ld-*.so found"
+
+      # 步骤 8: 读取要构建的包列表
       - name: Determine packages to build
         id: get-packages
         run: |
@@ -104,7 +124,7 @@ jobs:
             exit 1
           fi
 
-      # 步骤 8: 构建指定的 IPK 包
+      # 步骤 9: 构建指定的 IPK 包 (已改进)
       - name: Build specified IPK packages
         working-directory: ./immortalwrt
         run: |
@@ -118,6 +138,14 @@ jobs:
           
           echo "Building packages: ${PACKAGE_LIST}"
           
+          # 首先构建所有包的依赖
+          echo "========== Building package dependencies =========="
+          for PKG in ${PACKAGE_LIST}; do
+            echo "Preparing dependencies for: ${PKG}"
+            make package/${PKG}/prepare V=s || echo "Prepare step failed for ${PKG}, continuing anyway"
+          done
+          
+          # 然后构建每个包
           for PKG in ${PACKAGE_LIST}; do
             echo "========== Building package: ${PKG} =========="
             
@@ -152,8 +180,13 @@ jobs:
             if make "$PKG_PATH/compile" V=s; then
               echo "Successfully built $PKG_NAME"
             else
-              echo "Failed to build $PKG_NAME"
-              exit 1
+              echo "Failed to build $PKG_NAME, trying with package name only"
+              if make "package/$PKG_NAME/compile" V=s; then
+                echo "Successfully built $PKG_NAME using package name only"
+              else
+                echo "Failed to build $PKG_NAME"
+                exit 1
+              fi
             fi
           done
           EOF
@@ -161,8 +194,7 @@ jobs:
           chmod +x build-packages.sh
           ./build-packages.sh
 
-
-      # 步骤 9: 收集构建的 IPK 包
+      # 步骤 10: 收集构建的 IPK 包
       - name: Collect IPK packages
         working-directory: ./immortalwrt
         run: |
@@ -177,7 +209,7 @@ jobs:
           cd ipk-packages
           tar -czvf ../ipk-packages.tar.gz *
 
-      # 步骤 10: 创建 Release
+      # 步骤 11: 创建 Release
       - name: Create Release
         id: create_release
         uses: actions/create-release@v1
@@ -193,7 +225,7 @@ jobs:
             构建时间: ${{ github.event.repository.updated_at }}
             构建的包: ${{ env.PACKAGES }}
 
-      # 步骤 11: 上传 IPK 包到 Release
+      # 步骤 12: 上传 IPK 包到 Release
       - name: Upload IPK packages to Release
         uses: actions/upload-release-asset@v1
         env:
@@ -204,7 +236,7 @@ jobs:
           asset_name: ipk-packages.tar.gz
           asset_content_type: application/gzip
 
-      # 步骤 12: 单独上传每个 IPK 文件到 Release
+      # 步骤 13: 单独上传每个 IPK 文件到 Release
       - name: Upload individual IPK files to Release
         run: |
           cd ./immortalwrt/ipk-packages/
