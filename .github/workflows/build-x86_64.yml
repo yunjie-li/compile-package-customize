@@ -1,0 +1,203 @@
+name: Build Custom IPKs from ImmortalWrt
+
+on:
+  push:
+    branches:
+      - main  # 或者你希望触发构建的分支
+    paths:
+      - 'package-list.txt'  # 当包列表文件变更时触发
+  workflow_dispatch:  # 允许手动触发工作流
+    inputs:
+      packages:
+        description: '要构建的包列表（用空格分隔）'
+        required: false
+        default: ''
+
+jobs:
+  build-ipks:
+    runs-on: ubuntu-latest
+    steps:
+      # 步骤 1: 检出当前仓库
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      # 步骤 2: 安装依赖项
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libncurses5-dev gawk git gettext unzip zlib1g-dev file python3 python3-distutils python3-setuptools rsync curl wget ccache xsltproc libxml-parser-perl flex bison quilt
+
+      # 步骤 3: 克隆 ImmortalWrt 源码
+      - name: Clone ImmortalWrt source code
+        run: |
+          git clone https://github.com/immortalwrt/immortalwrt.git
+          cd immortalwrt
+          
+          # 可选：切换到特定分支或标签
+          git checkout openwrt-24.10
+
+      # 步骤 4: 添加 kenzok8 的 small-package 软件源
+      - name: Add kenzok8 small-package feed
+        working-directory: ./immortalwrt
+        run: |
+          # 添加 small-package 软件源到 feeds.conf.default
+          sed -i '$a src-git smpackage https://github.com/kenzok8/small-package' feeds.conf.default
+          
+          # 显示修改后的 feeds.conf.default 内容
+          echo "==== feeds.conf.default 内容 ===="
+          cat feeds.conf.default
+
+      # 步骤 5: 更新和安装 feeds
+      - name: Update and install feeds
+        working-directory: ./immortalwrt
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      # 步骤 6: 准备构建配置
+      - name: Prepare build configuration
+        working-directory: ./immortalwrt
+        run: |
+          # 创建最小化的 .config 文件
+          cat > .config <<EOF
+          CONFIG_MODULES=y
+          CONFIG_HAVE_DOT_CONFIG=y
+          CONFIG_TARGET_x86=y
+          CONFIG_TARGET_x86_64=y
+          CONFIG_TARGET_x86_64_DEVICE_generic=y
+          CONFIG_PACKAGE_luci=y
+          # 添加其他必要的基础配置
+          EOF
+          
+          # 使用 defconfig 补全配置
+          make defconfig
+
+      # 步骤 7: 读取要构建的包列表
+      - name: Determine packages to build
+        id: get-packages
+        run: |
+          if [ -n "${{ github.event.inputs.packages }}" ]; then
+            # 使用手动输入的包列表
+            echo "PACKAGES=${{ github.event.inputs.packages }}" >> $GITHUB_ENV
+          elif [ -f "package-list.txt" ]; then
+            # 从文件读取包列表
+            PKGS=$(cat package-list.txt | grep -v '^#' | tr '\n' ' ')
+            echo "PACKAGES=${PKGS}" >> $GITHUB_ENV
+          else
+            echo "No packages specified. Please provide a package-list.txt file or use workflow_dispatch input."
+            exit 1
+          fi
+
+      # 步骤 8: 构建指定的 IPK 包
+      - name: Build specified IPK packages
+        working-directory: ./immortalwrt
+        run: |
+          # 创建构建脚本
+          cat > build-packages.sh <<'EOF'
+          #!/bin/bash
+          set -e
+          
+          # 读取环境变量中的包列表
+          PACKAGE_LIST="${PACKAGES}"
+          
+          echo "Building packages: ${PACKAGE_LIST}"
+          
+          for PKG in ${PACKAGE_LIST}; do
+            echo "========== Building package: ${PKG} =========="
+            
+            # 检查是否包含路径分隔符
+            if [[ "$PKG" == */* ]]; then
+              # 包含路径，直接使用
+              PKG_PATH="$PKG"
+              PKG_NAME=$(basename "$PKG")
+              echo "Using specified path: $PKG_PATH"
+            else
+              # 不包含路径，尝试查找
+              PKG_NAME="$PKG"
+              
+              # 尝试在不同位置查找包
+              if [ -d "package/$PKG" ]; then
+                PKG_PATH="package/$PKG"
+              elif [ -d "package/feeds/smpackage/$PKG" ]; then
+                PKG_PATH="package/feeds/smpackage/$PKG"
+              else
+                # 使用find命令查找包路径
+                PKG_PATH=$(find package feeds -name "$PKG" -type d | head -n 1)
+                if [ -z "$PKG_PATH" ]; then
+                  echo "Error: Package $PKG not found in any location"
+                  exit 1
+                fi
+              fi
+              echo "Found package at: $PKG_PATH"
+            fi
+            
+            # 构建包
+            echo "Building: make $PKG_PATH/compile V=s"
+            if make "$PKG_PATH/compile" V=s; then
+              echo "Successfully built $PKG_NAME"
+            else
+              echo "Failed to build $PKG_NAME"
+              exit 1
+            fi
+          done
+          EOF
+          
+          chmod +x build-packages.sh
+          ./build-packages.sh
+
+
+      # 步骤 9: 收集构建的 IPK 包
+      - name: Collect IPK packages
+        working-directory: ./immortalwrt
+        run: |
+          mkdir -p ipk-packages
+          find bin/packages/ -name "*.ipk" -exec cp {} ipk-packages/ \;
+          find bin/targets/ -name "*.ipk" -exec cp {} ipk-packages/ \;
+          
+          # 创建包列表文件
+          ls -la ipk-packages/ > ipk-packages/package-list.txt
+          
+          # 打包所有 IPK 文件
+          cd ipk-packages
+          tar -czvf ../ipk-packages.tar.gz *
+
+      # 步骤 10: 创建 Release
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ipk-build-${{ github.run_number }}
+          release_name: IPK Build ${{ github.run_number }}
+          draft: false
+          prerelease: false
+          body: |
+            自动构建的 IPK 包
+            构建时间: ${{ github.event.repository.updated_at }}
+            构建的包: ${{ env.PACKAGES }}
+
+      # 步骤 11: 上传 IPK 包到 Release
+      - name: Upload IPK packages to Release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ steps.create_release.outputs.upload_url }}
+          asset_path: ./immortalwrt/ipk-packages.tar.gz
+          asset_name: ipk-packages.tar.gz
+          asset_content_type: application/gzip
+
+      # 步骤 12: 单独上传每个 IPK 文件到 Release
+      - name: Upload individual IPK files to Release
+        run: |
+          cd ./immortalwrt/ipk-packages/
+          for ipk in *.ipk; do
+            if [ -f "$ipk" ]; then
+              curl -X POST \
+                -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+                -H "Content-Type: application/octet-stream" \
+                --data-binary @"$ipk" \
+                "${{ steps.create_release.outputs.upload_url }}?name=$ipk"
+            fi
+          done
